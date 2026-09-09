@@ -165,6 +165,8 @@ def command_auth_gate(args: argparse.Namespace) -> int:
     command = ["gh", "secret", "list", "--json", "name"]
     if args.repo:
         command.extend(["--repo", args.repo])
+    names: set[str] = set()
+    gh_failed = False
     try:
         result = subprocess.run(
             command,
@@ -173,17 +175,29 @@ def command_auth_gate(args: argparse.Namespace) -> int:
             text=True,
         )
         if result.returncode != 0:
-            print("ABSENT")
-            return 2
-        payload = json.loads(result.stdout)
-        present = any(
-            isinstance(item, dict) and item.get("name") == args.secret
-            for item in payload
-        )
+            gh_failed = True
+        else:
+            payload = json.loads(result.stdout)
+            names = {
+                item.get("name")
+                for item in payload
+                if isinstance(item, dict) and item.get("name")
+            }
     except (OSError, json.JSONDecodeError):
-        present = False
-    print("PRESENT" if present else "ABSENT")
-    return 0 if present else 2
+        gh_failed = True
+
+    secrets: list[str] = args.secret
+    if len(secrets) == 1:
+        present = not gh_failed and secrets[0] in names
+        print("PRESENT" if present else "ABSENT")
+        return 0 if present else 2
+
+    all_present = True
+    for secret in secrets:
+        present = not gh_failed and secret in names
+        all_present = all_present and present
+        print(f"{secret}: {'PRESENT' if present else 'ABSENT'}")
+    return 0 if all_present else 2
 
 
 def parse_markdown_sections(text: str) -> list[tuple[str, str]]:
@@ -287,13 +301,49 @@ def _read_manifest_for_verify(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _check_manifest_report_binding(
+    manifest: dict[str, Any], report_values: dict[str, str]
+) -> list[str]:
+    """Cross-checks a manifest and its Hub Report agree on task identity.
+
+    Confirms task_id and branch match between the manifest that authorized
+    the work and the report that claims to account for it, so a report
+    cannot be silently swapped onto an unrelated manifest.
+    """
+    problems = []
+    manifest_task_id = str(manifest.get("task_id", "")).strip()
+    report_task_id = report_values.get("task_id", "").strip()
+    if manifest_task_id and report_task_id and manifest_task_id != report_task_id:
+        problems.append(
+            f"manifest task_id ({manifest_task_id!r}) does not match "
+            f"report task_id ({report_task_id!r})"
+        )
+    manifest_branch = str(manifest.get("branch", "")).strip()
+    report_branch = report_values.get("branch", "").strip()
+    if manifest_branch and report_branch and manifest_branch != report_branch:
+        problems.append(
+            f"manifest branch ({manifest_branch!r}) does not match "
+            f"report branch ({report_branch!r})"
+        )
+    return problems
+
+
+def _commit_exists(sha: str) -> bool:
+    try:
+        _run_git("cat-file", "-e", f"{sha}^{{commit}}")
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 def command_verify(args: argparse.Namespace) -> int:
     report_path = Path(args.report)
     try:
         text = report_path.read_text(encoding="utf-8")
         problems = [f"possible secret material: {label}" for label in find_leaks(text)]
+        report_values: dict[str, str] = {}
         if not problems:
-            _report_values(text)
+            report_values = _report_values(text)
         if args.manifest:
             manifest_text = Path(args.manifest).read_text(encoding="utf-8")
             problems.extend(
@@ -301,6 +351,8 @@ def command_verify(args: argparse.Namespace) -> int:
                 for label in find_leaks(manifest_text)
             )
             manifest = _read_manifest_for_verify(Path(args.manifest))
+            if report_values:
+                problems.extend(_check_manifest_report_binding(manifest, report_values))
             if not args.no_git:
                 base, head = _extract_diff_endpoints(manifest)
                 changed = _run_git("diff", "--name-only", base, head).splitlines()
@@ -310,6 +362,12 @@ def command_verify(args: argparse.Namespace) -> int:
                     problems.append(
                         "changed paths outside WRITABLE_SCOPE: " + ", ".join(outside)
                     )
+                if report_values:
+                    head_sha = report_values["HEAD_SHA"].strip()
+                    if head_sha and not _commit_exists(head_sha):
+                        problems.append(
+                            f"report HEAD_SHA does not resolve to a known commit: {head_sha}"
+                        )
     except (OSError, UnicodeError, subprocess.CalledProcessError, OutriggerError) as exc:
         problems = [str(exc)]
     if problems:
@@ -361,11 +419,27 @@ def command_ledger(args: argparse.Namespace) -> int:
             )
         )
     rows.sort(key=lambda row: row[0])
+    next_batch = max((row[0] for row in rows), default=0) + 1
+    if args.json:
+        payload = {
+            "batches": [
+                {
+                    "batch": batch,
+                    "unit": unit,
+                    "agent": agent,
+                    "status": status,
+                    "verdict": verdict,
+                }
+                for batch, unit, agent, status, verdict in rows
+            ],
+            "next_expected_batch": next_batch,
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
     print("| Batch | Unit | Agent | Status | Verdict |")
     print("|---:|---|---|---|---|")
     for batch, unit, agent, status, verdict in rows:
         print(f"| {batch or '-'} | {unit} | {agent} | {status} | {verdict} |")
-    next_batch = max((row[0] for row in rows), default=0) + 1
     print(f"\nNext expected batch: {next_batch}")
     return 0
 
@@ -383,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     new_parser.set_defaults(handler=command_new)
 
     auth_parser = subparsers.add_parser("auth-gate")
-    auth_parser.add_argument("--secret", required=True)
+    auth_parser.add_argument("--secret", required=True, nargs="+")
     auth_parser.add_argument("--repo")
     auth_parser.set_defaults(handler=command_auth_gate)
 
@@ -395,6 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ledger_parser = subparsers.add_parser("ledger")
     ledger_parser.add_argument("--dir", default=".outrigger/handoffs")
+    ledger_parser.add_argument("--json", action="store_true")
     ledger_parser.set_defaults(handler=command_ledger)
     return parser
 

@@ -153,6 +153,35 @@ class AuthGateTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertEqual(output.getvalue().strip(), "ABSENT")
 
+    @mock.patch("cli.outrigger.subprocess.run")
+    def test_multi_secret_reports_each_and_exits_zero_when_all_present(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([{"name": "A"}, {"name": "B"}]),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = outrigger.main(
+                ["auth-gate", "--secret", "A", "B", "--repo", "o/r"]
+            )
+        self.assertEqual(code, 0)
+        lines = output.getvalue().strip().splitlines()
+        self.assertEqual(lines, ["A: PRESENT", "B: PRESENT"])
+        run.assert_called_once()
+
+    @mock.patch("cli.outrigger.subprocess.run")
+    def test_multi_secret_exits_two_when_any_absent(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([{"name": "A"}]),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = outrigger.main(["auth-gate", "--secret", "A", "B"])
+        self.assertEqual(code, 2)
+        lines = output.getvalue().strip().splitlines()
+        self.assertEqual(lines, ["A: PRESENT", "B: ABSENT"])
+
 
 class InitAndNewTests(unittest.TestCase):
     def test_init_is_idempotent_and_does_not_overwrite_templates(self):
@@ -249,10 +278,10 @@ class VerifyTests(unittest.TestCase):
     def test_verify_checks_git_diff_containment(self, run_git):
         manifest = {
             "protocol": "OPS-1",
-            "task_id": "unit",
+            "task_id": "batch-2",
             "objective": "",
             "writable_scope": ["cli/", "tests/test_outrigger.py"],
-            "branch": "feat/unit",
+            "branch": "feat/batch-2-engine-and-tests",
             "acceptance_criteria": [],
             "validation_commands": ["git diff --name-only base123 HEAD"],
             "forbidden_actions": [],
@@ -263,14 +292,17 @@ class VerifyTests(unittest.TestCase):
             manifest_path = Path(temporary) / "manifest.json"
             report.write_text(hub_report(), encoding="utf-8")
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            run_git.return_value = "cli/outrigger.py\ntests/test_outrigger.py"
+            run_git.side_effect = [
+                "cli/outrigger.py\ntests/test_outrigger.py",
+                None,
+            ]
             self.assertEqual(
                 outrigger.main(
                     ["verify", str(report), "--manifest", str(manifest_path)]
                 ),
                 0,
             )
-            run_git.return_value = "cli/outrigger.py\nSPEC.md"
+            run_git.side_effect = ["cli/outrigger.py\nSPEC.md", None]
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = outrigger.main(
@@ -278,6 +310,96 @@ class VerifyTests(unittest.TestCase):
                 )
         self.assertEqual(code, 1)
         self.assertIn("SPEC.md", output.getvalue())
+
+    def test_verify_rejects_manifest_report_task_id_mismatch(self):
+        manifest = {
+            "protocol": "OPS-1",
+            "task_id": "batch-9",
+            "objective": "",
+            "writable_scope": ["cli/"],
+            "branch": "feat/batch-2-engine-and-tests",
+            "acceptance_criteria": [],
+            "validation_commands": [],
+            "forbidden_actions": [],
+            "handoff_path": ".outrigger/handoffs/batch-9-hub-report.md",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.md"
+            manifest_path = Path(temporary) / "manifest.json"
+            report.write_text(hub_report(), encoding="utf-8")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = outrigger.main(
+                    [
+                        "verify",
+                        str(report),
+                        "--manifest",
+                        str(manifest_path),
+                        "--no-git",
+                    ]
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("task_id", output.getvalue())
+
+    def test_verify_rejects_manifest_report_branch_mismatch(self):
+        manifest = {
+            "protocol": "OPS-1",
+            "task_id": "batch-2",
+            "objective": "",
+            "writable_scope": ["cli/"],
+            "branch": "feat/other-branch",
+            "acceptance_criteria": [],
+            "validation_commands": [],
+            "forbidden_actions": [],
+            "handoff_path": ".outrigger/handoffs/batch-2-hub-report.md",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.md"
+            manifest_path = Path(temporary) / "manifest.json"
+            report.write_text(hub_report(), encoding="utf-8")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = outrigger.main(
+                    [
+                        "verify",
+                        str(report),
+                        "--manifest",
+                        str(manifest_path),
+                        "--no-git",
+                    ]
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("branch", output.getvalue())
+
+    @mock.patch("cli.outrigger._commit_exists", return_value=False)
+    @mock.patch("cli.outrigger._run_git")
+    def test_verify_rejects_unresolvable_head_sha(self, run_git, commit_exists):
+        manifest = {
+            "protocol": "OPS-1",
+            "task_id": "batch-2",
+            "objective": "",
+            "writable_scope": ["cli/"],
+            "branch": "feat/batch-2-engine-and-tests",
+            "acceptance_criteria": [],
+            "validation_commands": ["git diff --name-only base123 HEAD"],
+            "forbidden_actions": [],
+            "handoff_path": ".outrigger/handoffs/batch-2-hub-report.md",
+        }
+        run_git.return_value = "cli/"
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.md"
+            manifest_path = Path(temporary) / "manifest.json"
+            report.write_text(hub_report(), encoding="utf-8")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = outrigger.main(
+                    ["verify", str(report), "--manifest", str(manifest_path)]
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("HEAD_SHA", output.getvalue())
 
 
 class LedgerTests(unittest.TestCase):
@@ -308,6 +430,25 @@ class LedgerTests(unittest.TestCase):
                 code = outrigger.main(["ledger", "--dir", temporary])
         self.assertEqual(code, 0)
         self.assertIn("Next expected batch: 1", output.getvalue())
+
+    def test_ledger_json_emits_structured_batches_and_next_expected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "batch-2-hub-report.md").write_text(
+                hub_report(task_id="unit-two", verdict="PASS"),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = outrigger.main(
+                    ["ledger", "--dir", str(directory), "--json"]
+                )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["next_expected_batch"], 3)
+        self.assertEqual(len(payload["batches"]), 1)
+        self.assertEqual(payload["batches"][0]["batch"], 2)
+        self.assertEqual(payload["batches"][0]["verdict"], "PASS")
 
 
 if __name__ == "__main__":
