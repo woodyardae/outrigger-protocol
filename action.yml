@@ -1,0 +1,30 @@
+name: Verify Outrigger report
+description: Verify an OPS-1 Hub Report and, optionally, its manifest scope.
+
+inputs:
+  report-path:
+    description: Repository-relative or absolute path to the Hub Report.
+    required: true
+  manifest-path:
+    description: Optional path to the OPS-1 Task Manifest.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Verify OPS-1 report
+      shell: bash
+      env:
+        OUTRIGGER_REPORT_PATH: ${{ inputs.report-path }}
+        OUTRIGGER_MANIFEST_PATH: ${{ inputs.manifest-path }}
+      run: |
+        arguments=("$OUTRIGGER_REPORT_PATH")
+        if [[ -n "$OUTRIGGER_MANIFEST_PATH" ]]; then
+          arguments+=(--manifest "$OUTRIGGER_MANIFEST_PATH")
+        fi
+        if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+          python "$GITHUB_ACTION_PATH/cli/outrigger.py" verify "${arguments[@]}"
+        else
+          python3 "$GITHUB_ACTION_PATH/cli/outrigger.py" verify "${arguments[@]}"
+        fi
