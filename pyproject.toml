@@ -1,0 +1,14 @@
+[build-system]
+requires = []
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "outrigger-protocol"
+version = "0.1.0"
+description = "A protocol for bounded task execution and evidence-based handoff."
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.scripts]
+outrigger = "cli.outrigger:main"
