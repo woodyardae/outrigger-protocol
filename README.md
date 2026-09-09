@@ -72,9 +72,10 @@ Prints an OPS-1 JSON Task Manifest to standard output. The generated manifest us
 ```sh
 outrigger auth-gate --secret SECRET_NAME
 outrigger auth-gate --secret SECRET_NAME --repo OWNER/REPOSITORY
+outrigger auth-gate --secret SECRET_ONE SECRET_TWO --repo OWNER/REPOSITORY
 ```
 
-Uses the GitHub CLI to list secret names, never secret values. It prints `PRESENT` and exits `0` when the name exists. Missing credentials, GitHub CLI errors, invalid responses, and an unavailable `gh` executable produce `ABSENT` and exit `2`. This command is the only CLI operation that calls an external executable.
+Uses the GitHub CLI to list secret names, never secret values. With a single `--secret`, it prints `PRESENT` and exits `0` when the name exists (unchanged from prior releases). With multiple `--secret` values, it prints one `NAME: PRESENT` or `NAME: ABSENT` line per secret and exits `0` only if all are present. Missing credentials, GitHub CLI errors, invalid responses, and an unavailable `gh` executable produce `ABSENT` results and exit `2`. This command is the only CLI operation that calls an external executable.
 
 ### `verify`
 
@@ -84,16 +85,17 @@ outrigger verify REPORT --manifest MANIFEST
 outrigger verify REPORT --manifest MANIFEST --no-git
 ```
 
-Checks exact OPS-1 report heading order, protocol, verdict, and recognizable secret material. With `--manifest`, it also validates the manifest and, unless `--no-git` is present, checks the manifest's Git diff endpoints against its writable scope. It prints `PASS` and exits `0` on success; otherwise it prints one or more `FAIL:` lines and exits `1`.
+Checks exact OPS-1 report heading order, protocol, verdict, and recognizable secret material. With `--manifest`, it also validates the manifest, cross-checks that the manifest's `task_id` and `branch` match the report's, and, unless `--no-git` is present, checks the manifest's Git diff endpoints against its writable scope and confirms the report's `HEAD_SHA` resolves to a known commit. It prints `PASS` and exits `0` on success; otherwise it prints one or more `FAIL:` lines and exits `1`.
 
 ### `ledger`
 
 ```sh
 outrigger ledger
 outrigger ledger --dir PATH
+outrigger ledger --dir PATH --json
 ```
 
-Reads Markdown reports from `.outrigger/handoffs/` by default, prints a batch-ordered summary table, and reports the next expected batch number. Unreadable report files are skipped.
+Reads Markdown reports from `.outrigger/handoffs/` by default, prints a batch-ordered summary table, and reports the next expected batch number. Unreadable report files are skipped. With `--json`, it prints a structured `{"batches": [...], "next_expected_batch": N}` payload instead of the Markdown table, for machine consumption.
 
 ## GitHub Action
 
