@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import subprocess
@@ -13,6 +14,9 @@ from typing import Any, Sequence
 
 PROTOCOL = "OPS-1"
 VERDICTS = {"PASS", "FAIL", "BLOCKED"}
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_BLOCKED = 2
 MANIFEST_FIELDS = (
     "protocol",
     "task_id",
@@ -53,6 +57,14 @@ HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 class OutriggerError(ValueError):
     """An input could not be verified safely."""
 
+
+class ScopeViolationError(OutriggerError):
+    """Changed paths fall outside the manifest writable whitelist."""
+
+    def __init__(self, violations: Sequence[str], message: str = "SCOPE_VIOLATION") -> None:
+        self.violations = list(violations)
+        detail = f"{message}: {', '.join(self.violations)}" if self.violations else message
+        super().__init__(detail)
 
 def _run_git(*args: str, cwd: Path | None = None) -> str:
     completed = subprocess.run(
@@ -142,8 +154,21 @@ def command_init(args: argparse.Namespace) -> int:
         if not target.exists():
             target.write_bytes(template.read_bytes())
             copied += 1
-    print(f"Initialized .outrigger ({copied} template(s) copied)")
-    return 0
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "status": "PASS",
+                    "violations": [],
+                    "exit_code": EXIT_PASS,
+                    "templates_copied": copied,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"Initialized .outrigger ({copied} template(s) copied)")
+    return EXIT_PASS
 
 
 def command_new(args: argparse.Namespace) -> int:
@@ -158,7 +183,7 @@ def command_new(args: argparse.Namespace) -> int:
         manifest["validation_commands"] = generated["validation_commands"]
         manifest["handoff_path"] = generated["handoff_path"]
     print(json.dumps(_validate_manifest_shape(manifest), indent=2))
-    return 0
+    return EXIT_PASS
 
 
 def command_auth_gate(args: argparse.Namespace) -> int:
@@ -187,17 +212,39 @@ def command_auth_gate(args: argparse.Namespace) -> int:
         gh_failed = True
 
     secrets: list[str] = args.secret
-    if len(secrets) == 1:
-        present = not gh_failed and secrets[0] in names
-        print("PRESENT" if present else "ABSENT")
-        return 0 if present else 2
+    results = {
+        secret: (not gh_failed and secret in names) for secret in secrets
+    }
+    all_present = all(results.values())
+    exit_code = EXIT_PASS if all_present else EXIT_BLOCKED
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "status": "PASS" if all_present else "BLOCKED",
+                    "violations": [
+                        f"secret absent: {name}"
+                        for name, present in results.items()
+                        if not present
+                    ],
+                    "exit_code": exit_code,
+                    "secrets": {
+                        name: ("PRESENT" if present else "ABSENT")
+                        for name, present in results.items()
+                    },
+                },
+                indent=2,
+            )
+        )
+        return exit_code
 
-    all_present = True
+    if len(secrets) == 1:
+        print("PRESENT" if results[secrets[0]] else "ABSENT")
+        return exit_code
+
     for secret in secrets:
-        present = not gh_failed and secret in names
-        all_present = all_present and present
-        print(f"{secret}: {'PRESENT' if present else 'ABSENT'}")
-    return 0 if all_present else 2
+        print(f"{secret}: {'PRESENT' if results[secret] else 'ABSENT'}")
+    return exit_code
 
 
 def parse_markdown_sections(text: str) -> list[tuple[str, str]]:
@@ -284,6 +331,67 @@ def path_is_allowed(path: str, scopes: Sequence[str]) -> bool:
     return False
 
 
+def path_matches_forbidden(path: str, patterns: Sequence[str]) -> bool:
+    """Return True when *path* matches any containment forbidden_patterns glob."""
+    candidate = path.replace("\\", "/")
+    for raw in patterns:
+        pattern = raw.replace("\\", "/")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(candidate, pattern):
+            return True
+        try:
+            if PurePosixPath(candidate).match(pattern):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def collect_scope_violations(
+    changed_paths: Sequence[str],
+    writable_paths: Sequence[str],
+    forbidden_patterns: Sequence[str] | None = None,
+) -> list[str]:
+    """Return human-readable violation messages for out-of-scope or forbidden paths."""
+    forbidden_patterns = forbidden_patterns or []
+    violations: list[str] = []
+    for raw_path in changed_paths:
+        if not raw_path.strip():
+            continue
+        path = raw_path.replace("\\", "/")
+        if path_matches_forbidden(path, forbidden_patterns):
+            violations.append(f"forbidden pattern match: {path}")
+            continue
+        if writable_paths and not path_is_allowed(path, writable_paths):
+            violations.append(f"outside writable scope: {path}")
+    return violations
+
+
+def _emit_status_payload(
+    *,
+    status: str,
+    violations: Sequence[str],
+    exit_code: int,
+    as_json: bool,
+) -> int:
+    payload = {
+        "status": status,
+        "violations": list(violations),
+        "exit_code": exit_code,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    elif status == "PASS" and not violations:
+        print("PASS")
+    else:
+        for item in violations:
+            print(f"{status}: {item}")
+        if not violations:
+            print(status)
+    return exit_code
+
+
 def _read_manifest_for_verify(path: Path) -> dict[str, Any]:
     manifest = _load_json(path)
     # Operational BASE/HEAD keys are accepted for compatibility, but a
@@ -299,6 +407,70 @@ def _read_manifest_for_verify(path: Path) -> dict[str, Any]:
     if "WRITABLE_SCOPE" in manifest and "writable_scope" not in manifest:
         manifest["writable_scope"] = manifest["WRITABLE_SCOPE"]
     return manifest
+
+
+def _is_containment_manifest(manifest: dict[str, Any]) -> bool:
+    return isinstance(manifest.get("containment"), dict)
+
+
+def _load_check_manifest(path: Path) -> dict[str, Any]:
+    manifest = _load_json(path)
+    if not isinstance(manifest, dict):
+        raise OutriggerError("manifest must be a JSON object")
+    if _is_containment_manifest(manifest):
+        containment = manifest["containment"]
+        if not isinstance(containment, dict):
+            raise OutriggerError("manifest containment must be an object")
+        writable = containment.get("writable_paths", [])
+        forbidden = containment.get("forbidden_patterns", [])
+        if not isinstance(writable, list) or not all(isinstance(item, str) for item in writable):
+            raise OutriggerError("containment.writable_paths must be an array of strings")
+        if not isinstance(forbidden, list) or not all(
+            isinstance(item, str) for item in forbidden
+        ):
+            raise OutriggerError(
+                "containment.forbidden_patterns must be an array of strings"
+            )
+        return manifest
+    return _read_manifest_for_verify(path)
+
+
+def _containment_policy(manifest: dict[str, Any]) -> tuple[list[str], list[str], str]:
+    """Return (writable_paths, forbidden_patterns, base_commit) for a manifest."""
+    if _is_containment_manifest(manifest):
+        containment = manifest["containment"]
+        writable = list(containment.get("writable_paths", []))
+        forbidden = list(containment.get("forbidden_patterns", []))
+        authority = manifest.get("authority")
+        base = "HEAD"
+        if isinstance(authority, dict) and authority.get("base_commit"):
+            base = str(authority["base_commit"])
+        return writable, forbidden, base
+    writable = list(manifest.get("writable_scope", []))
+    base, _head = _extract_diff_endpoints(manifest)
+    return writable, [], base
+
+
+def check_git_diff_scope(
+    manifest: dict[str, Any],
+    *,
+    cwd: Path | None = None,
+    base_commit: str | None = None,
+) -> list[str]:
+    """Compare git-diff paths to the manifest containment whitelist.
+
+    Uses ``git diff --name-only <base_commit>`` (OPS-1 Rule 4). Any path
+    outside ``writable_paths`` / ``writable_scope`` or matching
+    ``forbidden_patterns`` is reported as a scope violation.
+    """
+    writable, forbidden, default_base = _containment_policy(manifest)
+    base = base_commit or default_base
+    changed = [
+        line.strip()
+        for line in _run_git("diff", "--name-only", base, cwd=cwd).splitlines()
+        if line.strip()
+    ]
+    return collect_scope_violations(changed, writable, forbidden)
 
 
 def _check_manifest_report_binding(
@@ -338,6 +510,9 @@ def _commit_exists(sha: str) -> bool:
 
 def command_verify(args: argparse.Namespace) -> int:
     report_path = Path(args.report)
+    as_json = getattr(args, "json", False)
+    scope_violations: list[str] = []
+    problems: list[str] = []
     try:
         text = report_path.read_text(encoding="utf-8")
         problems = [f"possible secret material: {label}" for label in find_leaks(text)]
@@ -355,13 +530,15 @@ def command_verify(args: argparse.Namespace) -> int:
                 problems.extend(_check_manifest_report_binding(manifest, report_values))
             if not args.no_git:
                 base, head = _extract_diff_endpoints(manifest)
-                changed = _run_git("diff", "--name-only", base, head).splitlines()
-                scopes = manifest.get("writable_scope", [])
-                outside = [path for path in changed if not path_is_allowed(path, scopes)]
-                if outside:
-                    problems.append(
-                        "changed paths outside WRITABLE_SCOPE: " + ", ".join(outside)
-                    )
+                changed = [
+                    line.strip()
+                    for line in _run_git("diff", "--name-only", base, head).splitlines()
+                    if line.strip()
+                ]
+                writable, forbidden, _ = _containment_policy(manifest)
+                scope_violations = collect_scope_violations(
+                    changed, writable, forbidden
+                )
                 if report_values:
                     head_sha = report_values["HEAD_SHA"].strip()
                     if head_sha and not _commit_exists(head_sha):
@@ -370,12 +547,66 @@ def command_verify(args: argparse.Namespace) -> int:
                         )
     except (OSError, UnicodeError, subprocess.CalledProcessError, OutriggerError) as exc:
         problems = [str(exc)]
+        scope_violations = []
+
+    if scope_violations:
+        return _emit_status_payload(
+            status="BLOCKED",
+            violations=scope_violations,
+            exit_code=EXIT_BLOCKED,
+            as_json=as_json,
+        )
     if problems:
-        for problem in problems:
-            print(f"FAIL: {problem}")
-        return 1
-    print("PASS")
-    return 0
+        return _emit_status_payload(
+            status="FAIL",
+            violations=problems,
+            exit_code=EXIT_FAIL,
+            as_json=as_json,
+        )
+    return _emit_status_payload(
+        status="PASS",
+        violations=[],
+        exit_code=EXIT_PASS,
+        as_json=as_json,
+    )
+
+
+def command_check(args: argparse.Namespace) -> int:
+    """Validate git-diff paths against a Task Manifest containment whitelist."""
+    as_json = getattr(args, "json", False)
+    try:
+        manifest = _load_check_manifest(Path(args.manifest))
+        violations = check_git_diff_scope(
+            manifest,
+            base_commit=getattr(args, "base", None) or None,
+        )
+    except ScopeViolationError as exc:
+        return _emit_status_payload(
+            status="BLOCKED",
+            violations=exc.violations or [str(exc)],
+            exit_code=EXIT_BLOCKED,
+            as_json=as_json,
+        )
+    except (OSError, UnicodeError, subprocess.CalledProcessError, OutriggerError) as exc:
+        return _emit_status_payload(
+            status="FAIL",
+            violations=[str(exc)],
+            exit_code=EXIT_FAIL,
+            as_json=as_json,
+        )
+    if violations:
+        return _emit_status_payload(
+            status="BLOCKED",
+            violations=violations,
+            exit_code=EXIT_BLOCKED,
+            as_json=as_json,
+        )
+    return _emit_status_payload(
+        status="PASS",
+        violations=[],
+        exit_code=EXIT_PASS,
+        as_json=as_json,
+    )
 
 
 def _first_line(value: str, default: str = "-") -> str:
@@ -435,13 +666,13 @@ def command_ledger(args: argparse.Namespace) -> int:
             "next_expected_batch": next_batch,
         }
         print(json.dumps(payload, indent=2))
-        return 0
+        return EXIT_PASS
     print("| Batch | Unit | Agent | Status | Verdict |")
     print("|---:|---|---|---|---|")
     for batch, unit, agent, status, verdict in rows:
         print(f"| {batch or '-'} | {unit} | {agent} | {status} | {verdict} |")
     print(f"\nNext expected batch: {next_batch}")
-    return 0
+    return EXIT_PASS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -449,23 +680,33 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init")
+    init_parser.add_argument("--json", action="store_true")
     init_parser.set_defaults(handler=command_init)
 
     new_parser = subparsers.add_parser("new")
     new_parser.add_argument("unit_name")
     new_parser.add_argument("--template")
+    new_parser.add_argument("--json", action="store_true")
     new_parser.set_defaults(handler=command_new)
 
     auth_parser = subparsers.add_parser("auth-gate")
     auth_parser.add_argument("--secret", required=True, nargs="+")
     auth_parser.add_argument("--repo")
+    auth_parser.add_argument("--json", action="store_true")
     auth_parser.set_defaults(handler=command_auth_gate)
 
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("report")
     verify_parser.add_argument("--manifest")
     verify_parser.add_argument("--no-git", action="store_true")
+    verify_parser.add_argument("--json", action="store_true")
     verify_parser.set_defaults(handler=command_verify)
+
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("--manifest", required=True)
+    check_parser.add_argument("--base", default="")
+    check_parser.add_argument("--json", action="store_true")
+    check_parser.set_defaults(handler=command_check)
 
     ledger_parser = subparsers.add_parser("ledger")
     ledger_parser.add_argument("--dir", default=".outrigger/handoffs")
@@ -476,12 +717,56 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        code = exc.code
+        if code in (None, 0):
+            return EXIT_PASS
+        return EXIT_FAIL if isinstance(code, int) and code else EXIT_FAIL
     try:
         return int(args.handler(args))
-    except (OutriggerError, subprocess.CalledProcessError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    except ScopeViolationError as exc:
+        payload = {
+            "status": "BLOCKED",
+            "violations": exc.violations or [str(exc)],
+            "exit_code": EXIT_BLOCKED,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_BLOCKED
+    except (OutriggerError, subprocess.CalledProcessError, OSError, UnicodeError) as exc:
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "status": "FAIL",
+                        "violations": [str(exc)],
+                        "exit_code": EXIT_FAIL,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    except Exception as exc:  # noqa: BLE001 — CLI boundary must never traceback
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "status": "FAIL",
+                        "violations": [f"unexpected error: {exc}"],
+                        "exit_code": EXIT_FAIL,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_FAIL
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+{
+  "ops_version": "1.0",
+  "task_id": "OPS-CURSOR-002",
+  "authority": {
+    "base_commit": "HEAD",
+    "target_branch": "cursor/opfs-worker-sync"
+  },
+  "containment": {
+    "writable_paths": [
+      "packages/freenext-worker/src/"
+    ],
+    "forbidden_patterns": [
+      "**/config/secrets.json",
+      "**/*.pem"
+    ]
+  },
+  "validation": {
+    "commands": [
+      "npm test -- --runInBand",
+      "npm run lint"
+    ],
+    "required_verdict": "PASS"
+  }
+}

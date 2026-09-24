@@ -308,7 +308,7 @@ class VerifyTests(unittest.TestCase):
                 code = outrigger.main(
                     ["verify", str(report), "--manifest", str(manifest_path)]
                 )
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertIn("SPEC.md", output.getvalue())
 
     def test_verify_rejects_manifest_report_task_id_mismatch(self):
@@ -387,7 +387,7 @@ class VerifyTests(unittest.TestCase):
             "forbidden_actions": [],
             "handoff_path": ".outrigger/handoffs/batch-2-hub-report.md",
         }
-        run_git.return_value = "cli/"
+        run_git.return_value = "cli/outrigger.py"
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "report.md"
             manifest_path = Path(temporary) / "manifest.json"

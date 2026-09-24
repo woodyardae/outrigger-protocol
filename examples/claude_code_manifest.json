@@ -1,0 +1,26 @@
+{
+  "ops_version": "1.0",
+  "task_id": "OPS-CLAUDE-001",
+  "authority": {
+    "base_commit": "HEAD~1",
+    "target_branch": "feature/claude-stream-parser"
+  },
+  "containment": {
+    "writable_paths": [
+      "src/parsers/",
+      "tests/test_parsers.py"
+    ],
+    "forbidden_patterns": [
+      ".env*",
+      "**/*credentials*",
+      ".git/**"
+    ]
+  },
+  "validation": {
+    "commands": [
+      "pytest tests/test_parsers.py",
+      "git diff --name-only"
+    ],
+    "required_verdict": "PASS"
+  }
+}

@@ -1,14 +1,17 @@
-[build-system]
-requires = []
-build-backend = "setuptools.build_meta"
+﻿[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "outrigger-protocol"
-version = "0.1.0"
-description = "A protocol for bounded task execution and evidence-based handoff."
-requires-python = ">=3.10"
-license = { file = "LICENSE" }
+version = "0.2.0"
+description = "Deterministic containment and invariant gating for autonomous coding agents"
+readme = "README.md"
+requires-python = ">=3.9"
 dependencies = []
 
 [project.scripts]
 outrigger = "cli.outrigger:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli"]
