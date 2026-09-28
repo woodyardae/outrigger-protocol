@@ -1,120 +1,53 @@
 # Outrigger Protocol
 
-Outrigger is a small protocol and standard-library CLI for bounded software work. It makes authority, writable scope, validation, and handoff evidence explicit so a coordinating hub can review an executor's result independently.
+[![Namespace](https://img.shields.io/badge/namespace-woodyardae-1B4F72)](https://alanwoodyard.com)
+[![Stack](https://img.shields.io/badge/stack-Python_stdlib_OPS--1-1A5276)](https://alanwoodyard.com)
+[![IP](https://img.shields.io/badge/IP-permissive__open_%7C_MIT-196F3D)](https://alanwoodyard.com)
 
-## Why this exists
+[Alan Woodyard](https://alanwoodyard.com)
 
-Repositories capsize when delegated work has no stable boundary. Common failure modes are:
+## System Role
 
-- an executor edits unrelated paths or works on the wrong branch;
-- credentials are exposed while checking whether they exist;
-- a partial implementation is presented as complete;
-- a verdict has no reproducible command or exit-code evidence;
-- the implementation commit and its handoff report cannot be distinguished;
-- concurrent units return inconsistent reports that a hub cannot compare.
+Outrigger is the sovereign containment harness and execution sandbox for autonomous coding agents. It implements the OPS-1 specification: a unit of work does not run until a manifest is verified, an auth gate passes, and the handoff ledger records the result.
 
-The name carries two engineering metaphors. A canoe outrigger places a float away from the hull to resist capsize. A crane outrigger widens the machine's support footprint before load is applied. OPS-1 applies both ideas to repositories: isolated task units provide lateral stability, and explicit authority and evidence widen the support base for a delivery decision.
+Registered tagline: zero-dependency POSIX agent-containment harness and OPS-1 gate. Package version 0.2.0. Console script: `outrigger` → `cli.outrigger:main`. Harvest maturity: working core (836 implementation LOC, 693 test LOC). Specification text: `SPEC.md`.
 
-## Architecture
+## Audited Architecture & Runtime
 
-Outrigger has four components:
+Pure Python standard library. Hatchling build. No third-party imports were harvested.
 
-1. **OPS-1 specification** — [`SPEC.md`](SPEC.md) defines authority, isolation, atomic delivery, evidence, report fields, and verdicts.
-2. **Task inputs** — a strict JSON Task Manifest and the files in `templates/` describe a bounded unit's objective, branch, writable scope, validation, prohibited actions, and handoff destination.
-3. **Execution tools** — `cli/outrigger.py` implements the dependency-free local commands; `action.yml` exposes report verification as a composite GitHub Action.
-4. **Hub outputs** — OPS-1 Hub Reports in `.outrigger/handoffs/` record commits, commands, exit codes, evidence, risks, blockers, and caveats; the ledger command summarizes them in batch order.
+| Path | Role |
+| --- | --- |
+| `cli/outrigger.py` | CLI and gate implementation |
+| `SPEC.md` | OPS-1 specification |
+| `templates/` | Unit templates for `outrigger new` |
+| `examples/` | Example manifests |
+| `tests/` | Gate and ledger tests |
+| `integrations/hf-space/app.py` | Optional demo front end, not the gate |
+| `install.ps1` | Local install helper |
+| `docs/SHOW_HN_OUTRIGGER.md` | Public explanation |
 
-## Quickstart without installation
+STAX Streamer emits task manifests toward this harness (`emits_task_manifests`). Outrigger is the authority that accepts or refuses them. The catalog names `outrigger-gate.py` as the historical gate file. The packaged entry today is `cli/outrigger.py`.
 
-Python 3.10 or later is required. The CLI itself uses only the Python standard library.
+## CLI / API Surface
 
-```sh
-python3 cli/outrigger.py --help
-python3 cli/outrigger.py verify .outrigger/handoffs/batch-2-hub-report.md --no-git
-python3 cli/outrigger.py ledger
+```text
+outrigger init [--json]
+outrigger new <unit_name> [--template <name>] [--json]
+outrigger auth-gate --secret <secret>... [--repo <path>] [--json]
+outrigger verify <report> [--manifest <path>] [--no-git] [--json]
+outrigger check --manifest <path> [--base <rev>] [--json]
+outrigger ledger [--dir .outrigger/handoffs] [--json]
 ```
 
-Install an editable development command with pip:
+`init` lays down the local harness. `new` creates a contained work unit from a template. `auth-gate` requires one or more `--secret` values and refuses to proceed without them. `verify` checks a report against a manifest and can skip git inspection with `--no-git`. `check` evaluates a manifest against an optional git base. `ledger` reads `.outrigger/handoffs` by default. `--json` on each command emits a machine-readable result.
 
-```sh
-python -m pip install -e .
-outrigger --help
-```
+There is no HTTP API on the gate. `integrations/hf-space/app.py` is a separate demo process.
 
-Install an isolated command with uv:
+## Operational Boundaries
 
-```sh
-uv tool install .
-outrigger --help
-```
+Permissive open source, MIT, public. The containment boundary is POSIX and local: manifests, secrets passed on the command line, and the handoff directory live in the repository the operator pointed at.
 
-## CLI
+`auth-gate` does not store a secret catalog in this repository. Callers pass secrets at invocation time. A manifest that fails `verify` or `check` is not an execution permit. Streamer, and any other emitter, stops at the manifest. The agent runs only after this CLI says the gate passed.
 
-### `init`
-
-```sh
-outrigger init
-```
-
-Creates `.outrigger/handoffs/` and copies the bundled Markdown templates into `.outrigger/templates/`. Existing templates are not overwritten, so the command is safe to repeat.
-
-### `new`
-
-```sh
-outrigger new UNIT_NAME
-outrigger new UNIT_NAME --template manifest.json
-```
-
-Prints an OPS-1 JSON Task Manifest to standard output. The generated manifest uses the current Git branch and commit, and names `.outrigger/handoffs/<unit-slug>-hub-report.md`. `--template` must point to a JSON object containing exactly the OPS-1 manifest fields; its task ID, branch, base-diff validation command, and handoff path are refreshed for the new unit.
-
-### `auth-gate`
-
-```sh
-outrigger auth-gate --secret SECRET_NAME
-outrigger auth-gate --secret SECRET_NAME --repo OWNER/REPOSITORY
-outrigger auth-gate --secret SECRET_ONE SECRET_TWO --repo OWNER/REPOSITORY
-```
-
-Uses the GitHub CLI to list secret names, never secret values. With a single `--secret`, it prints `PRESENT` and exits `0` when the name exists (unchanged from prior releases). With multiple `--secret` values, it prints one `NAME: PRESENT` or `NAME: ABSENT` line per secret and exits `0` only if all are present. Missing credentials, GitHub CLI errors, invalid responses, and an unavailable `gh` executable produce `ABSENT` results and exit `2`. This command is the only CLI operation that calls an external executable.
-
-### `verify`
-
-```sh
-outrigger verify REPORT
-outrigger verify REPORT --manifest MANIFEST
-outrigger verify REPORT --manifest MANIFEST --no-git
-```
-
-Checks exact OPS-1 report heading order, protocol, verdict, and recognizable secret material. With `--manifest`, it also validates the manifest, cross-checks that the manifest's `task_id` and `branch` match the report's, and, unless `--no-git` is present, checks the manifest's Git diff endpoints against its writable scope and confirms the report's `HEAD_SHA` resolves to a known commit. It prints `PASS` and exits `0` on success; otherwise it prints one or more `FAIL:` lines and exits `1`.
-
-### `ledger`
-
-```sh
-outrigger ledger
-outrigger ledger --dir PATH
-outrigger ledger --dir PATH --json
-```
-
-Reads Markdown reports from `.outrigger/handoffs/` by default, prints a batch-ordered summary table, and reports the next expected batch number. Unreadable report files are skipped. With `--json`, it prints a structured `{"batches": [...], "next_expected_batch": N}` payload instead of the Markdown table, for machine consumption.
-
-## GitHub Action
-
-The composite action requires `report-path`; `manifest-path` is optional. It executes the checked-in verifier from the action installation directory, so it does not depend on the caller's checkout containing Outrigger's CLI. The job must provide Python 3.
-
-```yaml
-steps:
-  - uses: actions/checkout@v4
-  - uses: actions/setup-python@v5
-    with:
-      python-version: "3.10"
-  - uses: woodyardae/outrigger-protocol@v1
-    with:
-      report-path: .outrigger/handoffs/release-hub-report.md
-      manifest-path: .outrigger/release-manifest.json
-```
-
-If the verifier fails, its nonzero exit status fails the action step.
-
-## Protocol and license
-
-The normative protocol is [`SPEC.md`](SPEC.md). Outrigger Protocol is available under the [`MIT License`](LICENSE).
+Local-first rule: `--no-git` weakens verification on purpose and must be an explicit flag. The default path inspects git.
