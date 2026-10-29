@@ -1,32 +1,63 @@
 ﻿name: 'Outrigger OPS-1 Containment Gate'
-description: 'Deterministic workspace boundary containment and secret-leak gating for autonomous agent PRs.'
+description: 'Deterministic process boundary, secret leak, and containment assertion for autonomous agent pipelines'
 author: 'Alan Woodyard'
 
-inputs:
-  manifest:
-    description: 'Path to task manifest JSON'
-    required: true
-  repo-path:
-    description: 'Working directory path'
-    required: false
-    default: '.'
-  test-command:
-    description: 'Verification test command to run before approving boundaries'
-    required: false
-    default: ''
+branding:
+  icon: 'shield'
+  color: 'red'
 
-runs: 
+inputs:
+  diff-target:
+    description: 'Git reference or commit range to evaluate'
+    required: false
+    default: 'HEAD~1..HEAD'
+  fail-closed:
+    description: 'Exit immediately with non-zero status on boundary or secret violation'
+    required: false
+    default: 'true'
+  python-version:
+    description: 'Python environment version'
+    required: false
+    default: '3.12'
+
+outputs:
+  contained:
+    description: 'Boolean flag ("true" or "false") indicating containment status'
+    value: ${{ steps.gate.outputs.contained }}
+  violations-count:
+    description: 'Number of detected violations'
+    value: ${{ steps.gate.outputs.violations_count }}
+
+runs:
   using: 'composite'
   steps:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
-    - name: Run Outrigger Invariant Gate
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Outrigger
       shell: bash
       run: |
-        python ${{ github.action_path }}/cli/outrigger.py check \
-          --repo "${{ inputs.repo-path }}" \
-          --manifest "${{ inputs.manifest }}" \
-          ${{ inputs.test-cmmand != '' && format('--test-cmd \"{0}\"', inputs.test-cmmand) !! '' }} \
-          --json
+        python -m pip install --upgrade pip
+        python -m pip install git+https://github.com/woodyardae/outrigger-protocol.git
+
+    - name: Run Outrigger Containment Evaluation
+      id: gate
+      shell: bash
+      run: |
+        DIFF_PAYLOAD=$(git diff "${{ inputs.diff-target }}")
+        
+        if [ -z "$DIFF_PAYLOAD" ]; then
+          echo "No diff detected within target range. Skipping inspection."
+          echo "contained=true" >> "$GITHUB_OUTPUT"
+          echo "violations_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        FAIL_FLAG=""
+        if [ "${{ inputs.fail-closed }}" = "true" ]; then
+          FAIL_FLAG="--fail-closed"
+        fi
+
+        echo "$DIFF_PAYLOAD" | outrigger gate verify - $FAIL_FLAG
