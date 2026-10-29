@@ -8,4 +8,4 @@ pip install git+https://github.com/woodyardae/outrigger-protocol.git
 
 ## Usage
 
-git diff HEAD~1 | outrigger gate verify - --fail-closed
+git diff HEAD~1 | outrigger verify - --fail-closed

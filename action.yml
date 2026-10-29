@@ -1,4 +1,4 @@
-﻿name: 'Outrigger OPS-1 Containment Gate'
+name: 'Outrigger OPS-1 Containment Gate'
 description: 'Deterministic process boundary, secret leak, and containment assertion for autonomous agent pipelines'
 author: 'Alan Woodyard'
 
@@ -60,4 +60,4 @@ runs:
           FAIL_FLAG="--fail-closed"
         fi
 
-        echo "$DIFF_PAYLOAD" | outrigger gate verify - $FAIL_FLAG
+        echo "$DIFF_PAYLOAD" | outrigger verify - $FAIL_FLAG

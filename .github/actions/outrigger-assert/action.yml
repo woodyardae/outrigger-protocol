@@ -1,6 +1,10 @@
-﻿name: 'Outrigger OPS-1 Containment Gate'
+name: 'Outrigger OPS-1 Containment Gate'
 description: 'Deterministic process boundary, secret leak, and containment assertion for autonomous agent pipelines'
 author: 'Alan Woodyard'
+
+branding:
+  icon: 'shield'
+  color: 'red'
 
 inputs:
   diff-target:
@@ -12,7 +16,7 @@ inputs:
     required: false
     default: 'true'
   python-version:
-    description: 'Python version'
+    description: 'Python environment version'
     required: false
     default: '3.12'
 
@@ -32,9 +36,11 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
-    - name: Install Outrigger Protocol
+    - name: Install Outrigger
       shell: bash
-      run: python -m pip install --upgrade pip outrigger-protocol
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install git+https://github.com/woodyardae/outrigger-protocol.git
 
     - name: Run Outrigger Containment Evaluation
       id: gate
@@ -43,7 +49,7 @@ runs:
         DIFF_PAYLOAD=$(git diff "${{ inputs.diff-target }}")
         
         if [ -z "$DIFF_PAYLOAD" ]; then
-          echo "No diff detected. Skipping inspection."
+          echo "No diff detected within target range. Skipping inspection."
           echo "contained=true" >> "$GITHUB_OUTPUT"
           echo "violations_count=0" >> "$GITHUB_OUTPUT"
           exit 0
@@ -54,4 +60,4 @@ runs:
           FAIL_FLAG="--fail-closed"
         fi
 
-        echo "$DIFF_PAYLOAD" | outrigger gate verify - $FAIL_FLAG
+        echo "$DIFF_PAYLOAD" | outrigger verify - $FAIL_FLAG
