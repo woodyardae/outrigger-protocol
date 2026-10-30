@@ -1,6 +1,10 @@
-name: 'Outrigger Agent Scope Assert'
+﻿name: 'Outrigger Agent Scope Assert'
 description: 'Assert fail-closed containment boundaries against LLM agent file operations'
 inputs:
+  version:
+    description: 'Outrigger core binary release version'
+    required: false
+    default: 'v0.2.0'
   allowed-roots:
     description: 'Comma-separated directory prefixes permitted for agent write operations'
     required: false
@@ -13,28 +17,36 @@ inputs:
     description: 'Path to export the structured JSON assertion audit record'
     required: false
     default: 'outrigger-audit.json'
+
 runs:
   using: 'composite'
   steps:
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: Install Outrigger Protocol CLI
+    - name: Fetch Outrigger Standalone Binary
       shell: bash
+      env:
+        OUTRIGGER_VERSION: ${{ inputs.version }}
       run: |
-        python -m pip install --upgrade pip
-        python -m pip install outrigger-protocol==0.2.0
+        OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        case "$OS_NAME" in
+          linux*)  BIN_TARGET="outrigger-linux-x86_64" ;;
+          darwin*) BIN_TARGET="outrigger-macos-universal" ;;
+          msys*|mingw*|cygwin*) BIN_TARGET="outrigger-windows-x86_64.exe" ;;
+          *) echo "Unsupported runner OS: $OS_NAME" && exit 1 ;;
+        esac
 
-    - name: Run Containment Assertion
+        DOWNLOAD_URL="https://github.com/woodyardae/outrigger-protocol/releases/download/${OUTRIGGER_VERSION}/${BIN_TARGET}"
+        echo "Downloading Outrigger core binary from ${DOWNLOAD_URL}..."
+        curl -fsSL -o "/tmp/outrigger" "$DOWNLOAD_URL"
+        chmod +x "/tmp/outrigger"
+
+    - name: Execute Containment Assertion
       shell: bash
       env:
         OUTRIGGER_ALLOWED_ROOTS: ${{ inputs.allowed-roots }}
         OUTRIGGER_FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
         OUTRIGGER_AUDIT_LOG: ${{ inputs.audit-log }}
       run: |
-        outrigger assert \
+        /tmp/outrigger assert \
           --allowed-roots "$OUTRIGGER_ALLOWED_ROOTS" \
           --fail-on-drift "$OUTRIGGER_FAIL_ON_DRIFT" \
           --output-log "$OUTRIGGER_AUDIT_LOG"
