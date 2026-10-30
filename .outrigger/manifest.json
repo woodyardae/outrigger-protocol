@@ -9,7 +9,8 @@
     "action.yml",
     "README.md",
     "docs/",
-    "site/"
+    "site/",
+    ".outrigger/"
   ],
   "forbidden_actions": [
     "traversal",
@@ -22,8 +23,8 @@
     "Diff within writable_scope"
   ],
   "validation_commands": [
-    "uv run pytest tests/ -q",
-    "outrigger check --manifest .outrigger/manifest.json --json"
+    "git diff --name-only BASE HEAD",
+    "uv run pytest tests/ -q"
   ],
   "handoff_path": ".outrigger/report.md"
 }

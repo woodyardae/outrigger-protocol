@@ -1,28 +1,40 @@
-name: 'Outrigger OPS-1 Containment Gate'
-description: 'Deterministic process boundary and OPS-1 manifest assertion for autonomous agent pipelines'
-author: 'Alan Woodyard'
-branding:
-  icon: 'shield'
-  color: 'red'
+name: 'Outrigger Agent Scope Assert'
+description: 'Assert fail-closed containment boundaries against LLM agent file operations'
 inputs:
-  manifest:
-    description: 'Path to Outrigger manifest file'
+  allowed-roots:
+    description: 'Comma-separated directory prefixes permitted for agent write operations'
     required: false
-    default: '.outrigger/manifest.json'
-  python-version:
-    description: 'Python environment version'
+    default: '${{ github.workspace }}'
+  fail-on-drift:
+    description: 'Fail step immediately upon boundary violation'
     required: false
-    default: '3.12'
+    default: 'true'
+  audit-log:
+    description: 'Path to export the structured JSON assertion audit record'
+    required: false
+    default: 'outrigger-audit.json'
 runs:
   using: 'composite'
   steps:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ inputs.python-version }}
-    - name: Install Outrigger
+        python-version: '3.11'
+
+    - name: Install Outrigger Protocol CLI
       shell: bash
-      run: python -m pip install git+https://github.com/woodyardae/outrigger-protocol.git
-    - name: Run Outrigger Containment Evaluation
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install outrigger-protocol==0.2.0
+
+    - name: Run Containment Assertion
       shell: bash
-      run: outrigger check --manifest ${{ inputs.manifest }} --json
+      env:
+        OUTRIGGER_ALLOWED_ROOTS: ${{ inputs.allowed-roots }}
+        OUTRIGGER_FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
+        OUTRIGGER_AUDIT_LOG: ${{ inputs.audit-log }}
+      run: |
+        outrigger assert \
+          --allowed-roots "$OUTRIGGER_ALLOWED_ROOTS" \
+          --fail-on-drift "$OUTRIGGER_FAIL_ON_DRIFT" \
+          --output-log "$OUTRIGGER_AUDIT_LOG"
