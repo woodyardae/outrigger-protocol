@@ -1,30 +1,44 @@
-# protocol
+## protocol
 OPS-1
-# task_id
+
+## task_id
 TASK-001
-# verdict
+
+## verdict
 PASS
-# summary
+
+## summary
 Deterministic process containment and manifest assertion verified.
-# branch
+
+## branch
 main
-# HEAD_SHA
-d336bbd
-# commits
-d336bbd
-# files_changed
+
+## HEAD_SHA
+8c0279f
+
+## commits
+8c0279f
+
+## files_changed
 action.yml, README.md, docs/OPS-1.md, site/index.html
-# commands
-outrigger check --manifest .outrigger/manifest.json --json
-# validation
+
+## commands
+outrigger check --manifest .outrigger/manifest.json --base HEAD~1 --json
+
+## validation
 All 40 pytest unit and containment assertions passing green.
-# evidence
+
+## evidence
 Subprocess returncode 0 with clean JSON status output.
-# risks
+
+## risks
 None identified.
-# blockers
+
+## blockers
 None.
-# attempt
+
+## attempt
 1
-# caveats
+
+## caveats
 None.
