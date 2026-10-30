@@ -1,6 +1,8 @@
 {
+  "protocol": "OPS-1",
   "task_id": "TASK-001",
   "branch": "main",
+  "objective": "Verify autonomous agent process containment and OPS-1 protocol integrity",
   "writable_scope": [
     "src/",
     "tests/",
@@ -8,5 +10,20 @@
     "README.md",
     "docs/",
     "site/"
-  ]
+  ],
+  "forbidden_actions": [
+    "traversal",
+    "secret_leak",
+    "unscoped_write"
+  ],
+  "acceptance_criteria": [
+    "40/40 test suite passes",
+    "Zero external dependencies",
+    "Diff within writable_scope"
+  ],
+  "validation_commands": [
+    "uv run pytest tests/ -q",
+    "outrigger check --manifest .outrigger/manifest.json --json"
+  ],
+  "handoff_path": ".outrigger/report.md"
 }
