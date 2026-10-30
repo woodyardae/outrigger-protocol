@@ -1,0 +1,1 @@
+{"task_id":"TASK-001","branch":"main","allowed_patterns":["src/**","tests/**"],"forbidden_patterns":["*.env","*.pem"]}

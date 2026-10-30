@@ -1,0 +1,12 @@
+{
+  "task_id": "TASK-001",
+  "branch": "main",
+  "writable_scope": [
+    "src/",
+    "tests/",
+    "action.yml",
+    "README.md",
+    "docs/",
+    "site/"
+  ]
+}
