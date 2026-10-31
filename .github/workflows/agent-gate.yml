@@ -1,0 +1,33 @@
+name: Outrigger Agent Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boundary-assert:
+    name: Enforce Agent Scope Boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Outrigger Protocol Assertion
+        uses: woodyardae/outrigger-protocol@v0.2.0
+        with:
+          manifest: '.outrigger/manifest.json'
+          fail-on-drift: 'true'
+          audit-log: 'outrigger-audit.json'

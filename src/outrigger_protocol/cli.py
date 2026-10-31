@@ -1,0 +1,841 @@
+"""
+Standard-library command line tools for the Outrigger protocol.
+Author: Alan Woodyard (https://alanwoodyard.com)
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any, Sequence
+
+
+PROTOCOL = "OPS-1"
+VERDICTS = {"PASS", "FAIL", "BLOCKED"}
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_BLOCKED = 2
+MANIFEST_FIELDS = (
+    "protocol",
+    "task_id",
+    "objective",
+    "writable_scope",
+    "branch",
+    "acceptance_criteria",
+    "validation_commands",
+    "forbidden_actions",
+    "handoff_path",
+)
+REPORT_FIELDS = (
+    "protocol",
+    "task_id",
+    "verdict",
+    "summary",
+    "branch",
+    "HEAD_SHA",
+    "commits",
+    "files_changed",
+    "commands",
+    "validation",
+    "evidence",
+    "risks",
+    "blockers",
+    "attempt",
+    "caveats",
+)
+LEAK_PATTERNS = (
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[a-zA-Z]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----"),
+)
+HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+
+
+class OutriggerError(ValueError):
+    """An input could not be verified safely."""
+
+
+class ScopeViolationError(OutriggerError):
+    """Changed paths fall outside the manifest writable whitelist."""
+
+    def __init__(self, violations: Sequence[str], message: str = "SCOPE_VIOLATION") -> None:
+        self.violations = list(violations)
+        detail = f"{message}: {', '.join(self.violations)}" if self.violations else message
+        super().__init__(detail)
+
+
+def _run_git(*args: str, cwd: Path | None = None) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-")
+    if not slug or slug in {".", ".."}:
+        raise OutriggerError("unit-name must contain a letter or number")
+    return slug
+
+
+def _default_manifest(unit_name: str, cwd: Path) -> dict[str, Any]:
+    base = _run_git("rev-parse", "HEAD", cwd=cwd)
+    branch = _run_git("branch", "--show-current", cwd=cwd)
+    unit = _slug(unit_name)
+    return {
+        "protocol": PROTOCOL,
+        "task_id": unit_name,
+        "objective": "",
+        "writable_scope": [],
+        "branch": branch,
+        "acceptance_criteria": [],
+        "validation_commands": [f"git diff --name-only {base} HEAD"],
+        "forbidden_actions": [],
+        "handoff_path": f".outrigger/handoffs/{unit}-hub-report.md",
+    }
+
+
+def _load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise OutriggerError(f"cannot read JSON manifest: {path}") from exc
+
+
+def _validate_manifest_shape(manifest: Any) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise OutriggerError("manifest must be a JSON object")
+    actual = set(manifest)
+    expected = set(MANIFEST_FIELDS)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unknown fields: {', '.join(unknown)}")
+        raise OutriggerError("; ".join(detail))
+    if manifest["protocol"] != PROTOCOL:
+        raise OutriggerError("manifest protocol must be OPS-1")
+    for field in (
+        "writable_scope",
+        "acceptance_criteria",
+        "validation_commands",
+        "forbidden_actions",
+    ):
+        if not isinstance(manifest[field], list) or not all(
+            isinstance(item, str) for item in manifest[field]
+        ):
+            raise OutriggerError(f"manifest {field} must be an array of strings")
+    for field in ("task_id", "objective", "branch", "handoff_path"):
+        if not isinstance(manifest[field], str):
+            raise OutriggerError(f"manifest {field} must be a string")
+    return manifest
+
+
+def command_init(args: argparse.Namespace) -> int:
+    root = Path.cwd()
+    (root / ".outrigger" / "handoffs").mkdir(parents=True, exist_ok=True)
+    destination = root / ".outrigger" / "templates"
+    destination.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        Path(__file__).resolve().parent.parent.parent / "templates",
+        Path(__file__).resolve().parent.parent / "templates",
+        Path.cwd() / "templates",
+        Path.cwd() / ".outrigger" / "templates",
+    ]
+    source = None
+    for cand in candidates:
+        if cand.is_dir():
+            source = cand
+            break
+    if not source:
+        raise OutriggerError("bundled templates directory is unavailable")
+    copied = 0
+    for template in sorted(source.glob("*.md")):
+        target = destination / template.name
+        if not target.exists():
+            target.write_bytes(template.read_bytes())
+            copied += 1
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "status": "PASS",
+                    "violations": [],
+                    "exit_code": EXIT_PASS,
+                    "templates_copied": copied,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"Initialized .outrigger ({copied} template(s) copied)")
+    return EXIT_PASS
+
+
+def command_new(args: argparse.Namespace) -> int:
+    manifest = _default_manifest(args.unit_name, Path.cwd())
+    if args.template:
+        template = _validate_manifest_shape(_load_json(Path(args.template)))
+        manifest.update(template)
+        generated = _default_manifest(args.unit_name, Path.cwd())
+        manifest["protocol"] = PROTOCOL
+        manifest["task_id"] = args.unit_name
+        manifest["branch"] = generated["branch"]
+        manifest["validation_commands"] = generated["validation_commands"]
+        manifest["handoff_path"] = generated["handoff_path"]
+    print(json.dumps(_validate_manifest_shape(manifest), indent=2))
+    return EXIT_PASS
+
+
+def command_auth_gate(args: argparse.Namespace) -> int:
+    command = ["gh", "secret", "list", "--json", "name"]
+    if args.repo:
+        command.extend(["--repo", args.repo])
+    names: set[str] = set()
+    gh_failed = False
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            gh_failed = True
+        else:
+            payload = json.loads(result.stdout)
+            names = {
+                item.get("name")
+                for item in payload
+                if isinstance(item, dict) and item.get("name")
+            }
+    except (OSError, json.JSONDecodeError):
+        gh_failed = True
+
+    secrets: list[str] = args.secret
+    results = {
+        secret: (not gh_failed and secret in names) for secret in secrets
+    }
+    all_present = all(results.values())
+    exit_code = EXIT_PASS if all_present else EXIT_BLOCKED
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "status": "PASS" if all_present else "BLOCKED",
+                    "violations": [
+                        f"secret absent: {name}"
+                        for name, present in results.items()
+                        if not present
+                    ],
+                    "exit_code": exit_code,
+                    "secrets": {
+                        name: ("PRESENT" if present else "ABSENT")
+                        for name, present in results.items()
+                    },
+                },
+                indent=2,
+            )
+        )
+        return exit_code
+
+    if len(secrets) == 1:
+        print("PRESENT" if results[secrets[0]] else "ABSENT")
+        return exit_code
+
+    for secret in secrets:
+        print(f"{secret}: {'PRESENT' if results[secret] else 'ABSENT'}")
+    return exit_code
+
+
+def parse_markdown_sections(text: str) -> list[tuple[str, str]]:
+    matches = list(HEADING_RE.finditer(text))
+    return [
+        (
+            match.group(1).strip(),
+            text[match.end() : matches[index + 1].start()].strip()
+            if index + 1 < len(matches)
+            else text[match.end() :].strip(),
+        )
+        for index, match in enumerate(matches)
+    ]
+
+
+def _report_values(text: str) -> dict[str, str]:
+    sections = parse_markdown_sections(text)
+    names = [name for name, _ in sections]
+    if names != list(REPORT_FIELDS):
+        missing = [field for field in REPORT_FIELDS if field not in names]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        messages = ["report headings must exactly match OPS-1 order"]
+        if missing:
+            messages.append(f"missing: {', '.join(missing)}")
+        if duplicates:
+            messages.append(f"duplicate: {', '.join(duplicates)}")
+        raise OutriggerError("; ".join(messages))
+    values = dict(sections)
+    if values["protocol"].strip() != PROTOCOL:
+        raise OutriggerError("report protocol must be OPS-1")
+    verdict = values["verdict"].strip()
+    if verdict not in VERDICTS:
+        raise OutriggerError("report verdict must be PASS, FAIL, or BLOCKED")
+    return values
+
+
+def find_leaks(text: str) -> list[str]:
+    labels = ("ghp_", "github_pat_", "xox token", "private key")
+    return [
+        label
+        for label, pattern in zip(labels, LEAK_PATTERNS)
+        if pattern.search(text)
+    ]
+
+
+def _extract_diff_endpoints(manifest: dict[str, Any]) -> tuple[str, str]:
+    explicit_base = manifest.get("BASE") or manifest.get("base")
+    explicit_head = manifest.get("HEAD") or manifest.get("head")
+    if explicit_base:
+        return str(explicit_base), str(explicit_head or "HEAD")
+    pattern = re.compile(r"^git diff --name-only\s+(\S+)\s+(\S+)$")
+    for command in manifest.get("validation_commands", []):
+        match = pattern.match(command.strip())
+        if match:
+            return match.group(1), match.group(2)
+    raise OutriggerError(
+        "manifest validation_commands must include "
+        "'git diff --name-only BASE HEAD'"
+    )
+
+
+def _normal_path(value: str, *, directory: bool = False) -> str:
+    value = value.replace("\\", "/")
+    pure = PurePosixPath(value)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise OutriggerError(f"unsafe repository-relative path: {value}")
+    normalized = str(pure)
+    if normalized in {"", "."}:
+        raise OutriggerError("empty scope paths are not allowed")
+    if directory and value.endswith("/"):
+        normalized += "/"
+    return normalized
+
+
+def path_is_allowed(path: str, scopes: Sequence[str]) -> bool:
+    candidate = _normal_path(path)
+    for raw_scope in scopes:
+        scope = _normal_path(raw_scope, directory=True)
+        if scope.endswith("/"):
+            if candidate.startswith(scope):
+                return True
+        elif candidate == scope:
+            return True
+    return False
+
+
+def path_matches_forbidden(path: str, patterns: Sequence[str]) -> bool:
+    """Return True when *path* matches any containment forbidden_patterns glob."""
+    candidate = path.replace("\\", "/")
+    for raw in patterns:
+        pattern = raw.replace("\\", "/")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(candidate, pattern):
+            return True
+        try:
+            if PurePosixPath(candidate).match(pattern):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def collect_scope_violations(
+    changed_paths: Sequence[str],
+    writable_paths: Sequence[str],
+    forbidden_patterns: Sequence[str] | None = None,
+) -> list[str]:
+    """Return human-readable violation messages for out-of-scope or forbidden paths."""
+    forbidden_patterns = forbidden_patterns or []
+    violations: list[str] = []
+    for raw_path in changed_paths:
+        if not raw_path.strip():
+            continue
+        path = raw_path.replace("\\", "/")
+        if path_matches_forbidden(path, forbidden_patterns):
+            violations.append(f"forbidden pattern match: {path}")
+            continue
+        if writable_paths and not path_is_allowed(path, writable_paths):
+            violations.append(f"outside writable scope: {path}")
+    return violations
+
+
+def _emit_status_payload(
+    *,
+    status: str,
+    violations: Sequence[str],
+    exit_code: int,
+    as_json: bool,
+) -> int:
+    payload = {
+        "status": status,
+        "violations": list(violations),
+        "exit_code": exit_code,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    elif status == "PASS" and not violations:
+        print("PASS")
+    else:
+        for item in violations:
+            print(f"{status}: {item}")
+        if not violations:
+            print(status)
+    return exit_code
+
+
+def _read_manifest_for_verify(path: Path) -> dict[str, Any]:
+    manifest = _load_json(path)
+    if isinstance(manifest, dict) and set(manifest) <= set(MANIFEST_FIELDS):
+        return _validate_manifest_shape(manifest)
+    if not isinstance(manifest, dict):
+        raise OutriggerError("manifest must be a JSON object")
+    allowed = set(MANIFEST_FIELDS) | {"BASE", "HEAD", "base", "head", "WRITABLE_SCOPE"}
+    unknown = set(manifest) - allowed
+    if unknown:
+        raise OutriggerError(f"unknown fields: {', '.join(sorted(unknown))}")
+    if "WRITABLE_SCOPE" in manifest and "writable_scope" not in manifest:
+        manifest["writable_scope"] = manifest["WRITABLE_SCOPE"]
+    return manifest
+
+
+def _is_containment_manifest(manifest: dict[str, Any]) -> bool:
+    return isinstance(manifest.get("containment"), dict)
+
+
+def _load_check_manifest(path: Path) -> dict[str, Any]:
+    manifest = _load_json(path)
+    if not isinstance(manifest, dict):
+        raise OutriggerError("manifest must be a JSON object")
+    if _is_containment_manifest(manifest):
+        containment = manifest["containment"]
+        if not isinstance(containment, dict):
+            raise OutriggerError("manifest containment must be an object")
+        writable = containment.get("writable_paths", [])
+        forbidden = containment.get("forbidden_patterns", [])
+        if not isinstance(writable, list) or not all(isinstance(item, str) for item in writable):
+            raise OutriggerError("containment.writable_paths must be an array of strings")
+        if not isinstance(forbidden, list) or not all(
+            isinstance(item, str) for item in forbidden
+        ):
+            raise OutriggerError(
+                "containment.forbidden_patterns must be an array of strings"
+            )
+        return manifest
+    return _read_manifest_for_verify(path)
+
+
+def _containment_policy(manifest: dict[str, Any]) -> tuple[list[str], list[str], str]:
+    """Return (writable_paths, forbidden_patterns, base_commit) for a manifest."""
+    if _is_containment_manifest(manifest):
+        containment = manifest["containment"]
+        writable = list(containment.get("writable_paths", []))
+        forbidden = list(containment.get("forbidden_patterns", []))
+        authority = manifest.get("authority")
+        base = "HEAD"
+        if isinstance(authority, dict) and authority.get("base_commit"):
+            base = str(authority["base_commit"])
+        return writable, forbidden, base
+    writable = list(manifest.get("writable_scope", []))
+    base, _head = _extract_diff_endpoints(manifest)
+    return writable, [], base
+
+
+def check_git_diff_scope(
+    manifest: dict[str, Any],
+    *,
+    cwd: Path | None = None,
+    base_commit: str | None = None,
+) -> list[str]:
+    """Compare git-diff paths to the manifest containment whitelist.
+
+    Uses ``git diff --name-only <base_commit>`` (OPS-1 Rule 4). Any path
+    outside ``writable_paths`` / ``writable_scope`` or matching
+    ``forbidden_patterns`` is reported as a scope violation.
+    """
+    writable, forbidden, default_base = _containment_policy(manifest)
+    base = base_commit or default_base
+    changed = [
+        line.strip()
+        for line in _run_git("diff", "--name-only", base, cwd=cwd).splitlines()
+        if line.strip()
+    ]
+    return collect_scope_violations(changed, writable, forbidden)
+
+
+def _check_manifest_report_binding(
+    manifest: dict[str, Any], report_values: dict[str, str]
+) -> list[str]:
+    """Cross-checks a manifest and its Hub Report agree on task identity."""
+    problems = []
+    manifest_task_id = str(manifest.get("task_id", "")).strip()
+    report_task_id = report_values.get("task_id", "").strip()
+    if manifest_task_id and report_task_id and manifest_task_id != report_task_id:
+        problems.append(
+            f"manifest task_id ({manifest_task_id!r}) does not match "
+            f"report task_id ({report_task_id!r})"
+        )
+    manifest_branch = str(manifest.get("branch", "")).strip()
+    report_branch = report_values.get("branch", "").strip()
+    if manifest_branch and report_branch and manifest_branch != report_branch:
+        problems.append(
+            f"manifest branch ({manifest_branch!r}) does not match "
+            f"report branch ({report_branch!r})"
+        )
+    return problems
+
+
+def _commit_exists(sha: str) -> bool:
+    try:
+        _run_git("cat-file", "-e", f"{sha}^{{commit}}")
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def command_verify(args: argparse.Namespace) -> int:
+    report_path = Path(args.report)
+    as_json = getattr(args, "json", False)
+    scope_violations: list[str] = []
+    problems: list[str] = []
+    try:
+        text = report_path.read_text(encoding="utf-8")
+        problems = [f"possible secret material: {label}" for label in find_leaks(text)]
+        report_values: dict[str, str] = {}
+        if not problems:
+            report_values = _report_values(text)
+        if args.manifest:
+            manifest_text = Path(args.manifest).read_text(encoding="utf-8")
+            problems.extend(
+                f"possible secret material in manifest: {label}"
+                for label in find_leaks(manifest_text)
+            )
+            manifest = _read_manifest_for_verify(Path(args.manifest))
+            if report_values:
+                problems.extend(_check_manifest_report_binding(manifest, report_values))
+            if not args.no_git:
+                base, head = _extract_diff_endpoints(manifest)
+                changed = [
+                    line.strip()
+                    for line in _run_git("diff", "--name-only", base, head).splitlines()
+                    if line.strip()
+                ]
+                writable, forbidden, _ = _containment_policy(manifest)
+                scope_violations = collect_scope_violations(
+                    changed, writable, forbidden
+                )
+                if report_values:
+                    head_sha = report_values["HEAD_SHA"].strip()
+                    if head_sha and not _commit_exists(head_sha):
+                        problems.append(
+                            f"report HEAD_SHA does not resolve to a known commit: {head_sha}"
+                        )
+    except (OSError, UnicodeError, subprocess.CalledProcessError, OutriggerError) as exc:
+        problems = [str(exc)]
+        scope_violations = []
+
+    if scope_violations:
+        return _emit_status_payload(
+            status="BLOCKED",
+            violations=scope_violations,
+            exit_code=EXIT_BLOCKED,
+            as_json=as_json,
+        )
+    if problems:
+        return _emit_status_payload(
+            status="FAIL",
+            violations=problems,
+            exit_code=EXIT_FAIL,
+            as_json=as_json,
+        )
+    return _emit_status_payload(
+        status="PASS",
+        violations=[],
+        exit_code=EXIT_PASS,
+        as_json=as_json,
+    )
+
+
+def command_check(args: argparse.Namespace) -> int:
+    """Validate git-diff paths against a Task Manifest containment whitelist."""
+    as_json = getattr(args, "json", False)
+    try:
+        manifest = _load_check_manifest(Path(args.manifest))
+        violations = check_git_diff_scope(
+            manifest,
+            base_commit=getattr(args, "base", None) or None,
+        )
+    except ScopeViolationError as exc:
+        return _emit_status_payload(
+            status="BLOCKED",
+            violations=exc.violations or [str(exc)],
+            exit_code=EXIT_BLOCKED,
+            as_json=as_json,
+        )
+    except (OSError, UnicodeError, subprocess.CalledProcessError, OutriggerError) as exc:
+        return _emit_status_payload(
+            status="FAIL",
+            violations=[str(exc)],
+            exit_code=EXIT_FAIL,
+            as_json=as_json,
+        )
+    if violations:
+        return _emit_status_payload(
+            status="BLOCKED",
+            violations=violations,
+            exit_code=EXIT_BLOCKED,
+            as_json=as_json,
+        )
+    return _emit_status_payload(
+        status="PASS",
+        violations=[],
+        exit_code=EXIT_PASS,
+        as_json=as_json,
+    )
+
+
+def _first_line(value: str, default: str = "-") -> str:
+    for line in value.splitlines():
+        clean = line.strip().strip("`").lstrip("- ").strip()
+        if clean:
+            return clean
+    return default
+
+
+def _batch_number(path: Path, sections: dict[str, str]) -> int:
+    candidates = (path.stem, sections.get("batch", ""), sections.get("task_id", ""))
+    for candidate in candidates:
+        match = re.search(r"\bbatch[-_ ]?(\d+)\b", candidate, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
+def command_ledger(args: argparse.Namespace) -> int:
+    directory = Path(args.dir)
+    rows: list[tuple[int, str, str, str, str]] = []
+    for report in directory.glob("*.md"):
+        try:
+            sections = {
+                name.lower(): value
+                for name, value in parse_markdown_sections(
+                    report.read_text(encoding="utf-8")
+                )
+            }
+        except (OSError, UnicodeError):
+            continue
+        batch = _batch_number(report, sections)
+        rows.append(
+            (
+                batch,
+                _first_line(sections.get("unit", sections.get("task_id", "-"))),
+                _first_line(sections.get("agent", "-")),
+                _first_line(sections.get("status", "-")),
+                _first_line(sections.get("verdict", "-")),
+            )
+        )
+    rows.sort(key=lambda row: row[0])
+    next_batch = max((row[0] for row in rows), default=0) + 1
+    if args.json:
+        payload = {
+            "batches": [
+                {
+                    "batch": batch,
+                    "unit": unit,
+                    "agent": agent,
+                    "status": status,
+                    "verdict": verdict,
+                }
+                for batch, unit, agent, status, verdict in rows
+            ],
+            "next_expected_batch": next_batch,
+        }
+        print(json.dumps(payload, indent=2))
+        return EXIT_PASS
+    print("| Batch | Unit | Agent | Status | Verdict |")
+    print("|---:|---|---|---|---|")
+    for batch, unit, agent, status, verdict in rows:
+        print(f"| {batch or '-'} | {unit} | {agent} | {status} | {verdict} |")
+    print(f"\nNext expected batch: {next_batch}")
+    return EXIT_PASS
+
+
+def _handle_proxy(args: argparse.Namespace) -> int:
+    from outrigger_protocol.proxy import run_stdio_proxy
+
+    target_cmd = list(args.cmd)
+    if target_cmd and target_cmd[0] == "--":
+        target_cmd = target_cmd[1:]
+
+    if not target_cmd:
+        sys.stderr.write("Error: No target MCP command specified after '--'.\n")
+        return 1
+
+    raw_scopes = getattr(args, "scopes", None) or getattr(args, "scope", None) or []
+    allowed_roots: list[Path] = [Path(s).resolve() for s in raw_scopes]
+
+    manifest_path = getattr(args, "manifest", None)
+    if manifest_path is None and not allowed_roots:
+        default_manifest = Path(".outrigger/manifest.json")
+        if default_manifest.exists():
+            manifest_path = default_manifest
+
+    if manifest_path is not None:
+        m_path = Path(manifest_path)
+        if not m_path.exists():
+            sys.stderr.write(f"Error: Manifest file not found at {m_path}\n")
+            return 1
+        try:
+            with open(m_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            scopes = data.get("writable_scope", [])
+            manifest_dir = m_path.parent.parent.resolve() if m_path.parent.name == ".outrigger" else m_path.parent.resolve()
+            for s in scopes:
+                sp = Path(s)
+                if not sp.is_absolute():
+                    sp = (manifest_dir / sp).resolve()
+                else:
+                    sp = sp.resolve()
+                allowed_roots.append(sp)
+        except Exception as e:
+            sys.stderr.write(f"Error reading manifest: {e}\n")
+            return 1
+
+    if not allowed_roots:
+        sys.stderr.write("Error: No allowed roots specified. Provide --scope <dir> or --manifest <file>.\n")
+        return 1
+
+    return run_stdio_proxy(target_cmd, allowed_roots)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="outrigger")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    init_parser = subparsers.add_parser("init")
+    init_parser.add_argument("--json", action="store_true")
+    init_parser.set_defaults(handler=command_init)
+
+    new_parser = subparsers.add_parser("new")
+    new_parser.add_argument("unit_name")
+    new_parser.add_argument("--template")
+    new_parser.add_argument("--json", action="store_true")
+    new_parser.set_defaults(handler=command_new)
+
+    for name in ("auth-gate", "auth"):
+        auth_parser = subparsers.add_parser(name)
+        auth_parser.add_argument("--secret", required=True, nargs="+")
+        auth_parser.add_argument("--repo")
+        auth_parser.add_argument("--json", action="store_true")
+        auth_parser.set_defaults(handler=command_auth_gate)
+
+    verify_parser = subparsers.add_parser("verify")
+    verify_parser.add_argument("report")
+    verify_parser.add_argument("--manifest")
+    verify_parser.add_argument("--no-git", action="store_true")
+    verify_parser.add_argument("--json", action="store_true")
+    verify_parser.set_defaults(handler=command_verify)
+
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("--manifest", required=True)
+    check_parser.add_argument("--base", default="")
+    check_parser.add_argument("--json", action="store_true")
+    check_parser.set_defaults(handler=command_check)
+
+    ledger_parser = subparsers.add_parser("ledger")
+    ledger_parser.add_argument("--dir", default=".outrigger/handoffs")
+    ledger_parser.add_argument("--json", action="store_true")
+    ledger_parser.set_defaults(handler=command_ledger)
+
+    proxy_parser = subparsers.add_parser("proxy")
+    proxy_parser.add_argument("--scope", dest="scopes", action="append", default=[])
+    proxy_parser.add_argument("--manifest", type=str, default=None)
+    proxy_parser.add_argument("cmd", nargs=argparse.REMAINDER)
+    proxy_parser.set_defaults(handler=_handle_proxy)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        code = exc.code
+        if code in (None, 0):
+            return EXIT_PASS
+        return EXIT_FAIL if isinstance(code, int) and code else EXIT_FAIL
+
+    subcmd = getattr(args, "subcommand", None) or getattr(args, "command", None)
+    if subcmd == "proxy":
+        return _handle_proxy(args)
+
+    try:
+        return int(args.handler(args))
+    except ScopeViolationError as exc:
+        payload = {
+            "status": "BLOCKED",
+            "violations": exc.violations or [str(exc)],
+            "exit_code": EXIT_BLOCKED,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_BLOCKED
+    except (OutriggerError, subprocess.CalledProcessError, OSError, UnicodeError) as exc:
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "status": "FAIL",
+                        "violations": [str(exc)],
+                        "exit_code": EXIT_FAIL,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    except Exception as exc:  # noqa: BLE001 — CLI boundary must never traceback
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "status": "FAIL",
+                        "violations": [f"unexpected error: {exc}"],
+                        "exit_code": EXIT_FAIL,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
